@@ -12,26 +12,32 @@ DA3 Inference Script: Image/Video Directory -> 3D Gaussian Splatting
   - 输出: 3DGS PLY文件 / GLB点云 / 渲染视频 / 深度图可视化
 
 用法示例:
-    # 1. 使用 HuggingFace 模型 (推荐):
-    python 推理.py --input_path ./images --output_path ./output --model_path depth-anything/DA3NESTED-GIANT-LARGE-1.1
+    # 1. 使用本地 DA3-Giant checkpoint (默认使用 da3-giant 配置):
+    python inference.py -i ./images -o ./output -m /path/to/da3-giant/
 
-    # 2. 使用本地模型:
-    python 推理.py --input_path ./images --output_path ./output --model_path ./local_model
+    # 2. 使用本地 checkpoint，指定不同的配置文件:
+    python inference.py -i ./images -o ./output -m /path/to/da3-giant/ -c da3-large
 
-    # 3. 处理单张图片:
-    python 推理.py --input_path ./test.jpg --output_path ./output --model_path depth-anything/DA3-LARGE-1.1
+    # 3. 使用 HuggingFace 模型 (推荐):
+    python inference.py -i ./images -o ./output -m depth-anything/DA3NESTED-GIANT-LARGE-1.1
 
-    # 4. 处理视频文件:
-    python 推理.py --input_path ./video.mp4 --output_path ./output --model_path depth-anything/DA3-LARGE-1.1 --video_fps 2.0
+    # 4. 处理单张图片:
+    python inference.py -i ./test.jpg -o ./output -m depth-anything/DA3-LARGE-1.1
 
-    # 5. 调整处理分辨率:
-    python 推理.py --input_path ./images --output_path ./output --model_path depth-anything/DA3-LARGE-1.1 --process_res 756
+    # 5. 处理视频文件:
+    python inference.py -i ./video.mp4 -o ./output -m depth-anything/DA3-LARGE-1.1 --video_fps 2.0
 
-    # 6. 仅导出 PLY 点云 (不渲染视频, 节省显存):
-    python 推理.py --input_path ./images --output_path ./output --model_path depth-anything/DA3-LARGE-1.1 --export_format gs_ply
+    # 6. 调整处理分辨率:
+    python inference.py -i ./images -o ./output -m depth-anything/DA3-LARGE-1.1 --process_res 756
 
-    # 7. 导出多个格式:
-    python 推理.py --input_path ./images --output_path ./output --model_path depth-anything/DA3-LARGE-1.1 --export_format "gs_ply,glb,depth_vis"
+    # 7. 仅导出 PLY 点云 (不渲染视频, 节省显存):
+    python inference.py -i ./images -o ./output -m depth-anything/DA3-LARGE-1.1 -f gs_ply
+
+    # 8. 导出多个格式:
+    python inference.py -i ./images -o ./output -m depth-anything/DA3-LARGE-1.1 -f "gs_ply,glb,depth_vis"
+
+    # 可用 --config 选项: da3-giant(默认), da3-large, da3-base, da3-small,
+    #                      da3metric-large, da3mono-large, da3nested-giant-large
 """
 
 from __future__ import annotations
@@ -60,7 +66,21 @@ from depth_anything_3.utils.logger import logger
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"}
 
-# Available models on HuggingFace
+# Default model config (used when local checkpoint has no config.json)
+DEFAULT_CONFIG_NAME = "da3-giant"
+
+# Available YAML configs bundled in the package
+BUNDLED_CONFIGS = {
+    "da3-giant": "depth_anything_3.configs.da3-giant",
+    "da3-large": "depth_anything_3.configs.da3-large",
+    "da3-base": "depth_anything_3.configs.da3-base",
+    "da3-small": "depth_anything_3.configs.da3-small",
+    "da3metric-large": "depth_anything_3.configs.da3metric-large",
+    "da3mono-large": "depth_anything_3.configs.da3mono-large",
+    "da3nested-giant-large": "depth_anything_3.configs.da3nested-giant-large",
+}
+
+# Short aliases for HuggingFace model IDs
 AVAILABLE_MODELS = {
     "da3-nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
     "da3-giant": "depth-anything/DA3-GIANT-1.1",
@@ -74,11 +94,22 @@ AVAILABLE_MODELS = {
 # ============================================================
 # Model loading
 # ============================================================
-def load_model(model_path: str, device: str = "cuda") -> DepthAnything3:
+def load_model(
+    model_path: str,
+    config_name: str = DEFAULT_CONFIG_NAME,
+    device: str = "cuda",
+) -> DepthAnything3:
     """Load DA3 model from local path or HuggingFace Hub.
 
+    For local checkpoints without config.json, uses the bundled YAML config
+    to build the model architecture, then loads the safetensors weights.
+
     Args:
-        model_path: Local directory path or HuggingFace model ID (e.g. "depth-anything/DA3-LARGE-1.1")
+        model_path: Local directory path or HuggingFace model ID
+        config_name: YAML config name to use for local checkpoints.
+                    Options: da3-giant (default), da3-large, da3-base, da3-small,
+                    da3metric-large, da3mono-large, da3nested-giant-large.
+                    Can also be a path to a custom .yaml file.
         device: Device to load model on ("cuda" or "cpu")
 
     Returns:
@@ -88,11 +119,21 @@ def load_model(model_path: str, device: str = "cuda") -> DepthAnything3:
 
     load_start = time.time()
     if os.path.exists(model_path):
-        model = DepthAnything3.from_pretrained(model_path)
+        config_json = os.path.join(model_path, "config.json")
+        safetensors_file = os.path.join(model_path, "model.safetensors")
+
+        if os.path.exists(config_json):
+            logger.info("Found config.json, using from_pretrained")
+            model = DepthAnything3.from_pretrained(model_path)
+        else:
+            logger.info(f"No config.json found, using config: {config_name}")
+            model = _build_model_from_yaml_and_load_weights(
+                model_path, config_name, safetensors_file
+            )
     else:
-        if model_path in AVAILABLE_MODELS:
-            model_path = AVAILABLE_MODELS[model_path]
-        model = DepthAnything3.from_pretrained(model_path)
+        hf_path = AVAILABLE_MODELS.get(model_path, model_path)
+        logger.info(f"Loading from HuggingFace: {hf_path}")
+        model = DepthAnything3.from_pretrained(hf_path)
 
     model = model.to(device)
     model.eval()
@@ -100,6 +141,58 @@ def load_model(model_path: str, device: str = "cuda") -> DepthAnything3:
     load_time = time.time() - load_start
     logger.info(f"Model loaded in {load_time:.1f}s on {device}")
     return model
+
+
+def _build_model_from_yaml_and_load_weights(
+    model_dir: str,
+    config_name: str,
+    safetensors_path: str,
+) -> DepthAnything3:
+    """Build model from YAML config, then load weights from safetensors."""
+    import safetensors.torch
+
+    from depth_anything_3.cfg import load_config
+    from depth_anything_3.model.da3 import DepthAnything3Net, NestedDepthAnything3Net
+
+    config_path = config_name
+    if config_name in BUNDLED_CONFIGS:
+        config_path = BUNDLED_CONFIGS[config_name]
+
+    logger.info(f"Loading config: {config_path}")
+    cfg = load_config(config_path)
+
+    obj_cfg = cfg.get("__object__", {})
+    model_cls_name = obj_cfg.get("name", "")
+
+    if model_cls_name == "NestedDepthAnything3Net":
+        model = NestedDepthAnything3Net(cfg.get("anyview"), cfg.get("metric"))
+    else:
+        model = DepthAnything3Net(
+            net=cfg.get("net"),
+            head=cfg.get("head"),
+            cam_dec=cfg.get("cam_dec"),
+            cam_enc=cfg.get("cam_enc"),
+            gs_head=cfg.get("gs_head"),
+            gs_adapter=cfg.get("gs_adapter"),
+        )
+
+    if os.path.exists(safetensors_path):
+        logger.info(f"Loading weights from: {safetensors_path}")
+        state_dict = safetensors.torch.load_file(safetensors_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warn(f"Missing keys: {missing}")
+        if unexpected:
+            logger.warn(f"Unexpected keys (ignored): {unexpected}")
+    else:
+        raise FileNotFoundError(
+            f"Safetensors file not found: {safetensors_path}\n"
+            f"Available files in {model_dir}: {os.listdir(model_dir)}"
+        )
+
+    wrapped = DepthAnything3(model_name=config_name)
+    wrapped.model = model
+    return wrapped
 
 
 # ============================================================
@@ -357,6 +450,7 @@ def run_inference(
     input_path: str,
     output_path: str,
     model_path: str,
+    config_name: str = DEFAULT_CONFIG_NAME,
     device: str = "cuda",
     export_format: str = "gs_ply,glb,depth_vis",
     process_res: int = 504,
@@ -377,6 +471,10 @@ def run_inference(
         input_path: Path to input (image file, image directory, or video file)
         output_path: Path to output directory
         model_path: Local model path or HuggingFace model ID
+        config_name: YAML config for building local model architecture.
+                   Options: da3-giant (default), da3-large, da3-base, da3-small,
+                   da3metric-large, da3mono-large, da3nested-giant-large.
+                   Or path to a custom .yaml file.
         device: Device to run inference on ("cuda" or "cpu")
         export_format: Comma-separated export formats.
                       Options: gs_ply, gs_video, glb, depth_vis, npz
@@ -426,7 +524,7 @@ def run_inference(
 
     # 3. Load model
     logger.info("=" * 60)
-    model = load_model(model_path, device=device)
+    model = load_model(model_path, config_name=config_name, device=device)
 
     # 4. Determine export formats
     export_formats = [f.strip() for f in export_format.split(",")]
@@ -545,6 +643,16 @@ def parse_args():
         "'da3-giant', 'da3-large', 'da3-base', 'da3-small')",
     )
     parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=DEFAULT_CONFIG_NAME,
+        choices=list(BUNDLED_CONFIGS.keys()),
+        help="YAML config for local checkpoint architecture. "
+        f"Options: {list(BUNDLED_CONFIGS.keys())}. "
+        "Or a path to a custom .yaml file. (default: da3-giant)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda",
@@ -656,6 +764,7 @@ def main():
         input_path=args.input_path,
         output_path=args.output_path,
         model_path=args.model_path,
+        config_name=args.config,
         device=args.device,
         export_format=args.export_format,
         process_res=args.process_res,
