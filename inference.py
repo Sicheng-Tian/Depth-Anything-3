@@ -179,11 +179,32 @@ def _build_model_from_yaml_and_load_weights(
     if os.path.exists(safetensors_path):
         logger.info(f"Loading weights from: {safetensors_path}")
         state_dict = safetensors.torch.load_file(safetensors_path)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        # Normalize keys: strip "model." prefix and map legacy MLP names
+        normalized = {}
+        for key, value in state_dict.items():
+            # Strip "model." prefix (checkpoint was saved with module wrapper)
+            k = key
+            if k.startswith("model."):
+                k = k[len("model.") :]
+
+            # Map legacy MLP naming: w12 -> fc1, w3 -> fc2
+            # (checkpoint was saved with flattened weights; model uses separate fc layers)
+            k = k.replace("mlp.w12", "mlp.fc1")
+            k = k.replace("mlp.w3", "mlp.fc2")
+
+            normalized[k] = value
+
+        logger.info(
+            f"Loaded {len(normalized)} keys from checkpoint, "
+            f"stripped 'model.' prefix and normalized MLP names"
+        )
+
+        missing, unexpected = model.load_state_dict(normalized, strict=False)
         if missing:
-            logger.warn(f"Missing keys: {missing}")
+            logger.warn(f"Missing keys ({len(missing)}): {missing}")
         if unexpected:
-            logger.warn(f"Unexpected keys (ignored): {unexpected}")
+            logger.warn(f"Unexpected keys ({len(unexpected)}): {unexpected}")
     else:
         raise FileNotFoundError(
             f"Safetensors file not found: {safetensors_path}\n"
